@@ -3,8 +3,17 @@ package com.example.smartcity
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.BroadcastReceiver
+import android.net.wifi.WifiManager
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
 import android.os.Build
 import android.os.Bundle
+import android.content.Context.BLUETOOTH_SERVICE
+import android.content.Context.WIFI_SERVICE
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -21,9 +30,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.MyLocation
@@ -56,6 +68,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -77,6 +90,9 @@ import com.google.android.gms.auth.api.signin.GoogleSignInStatusCodes
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.tasks.Task
 import org.osmdroid.config.Configuration
+import org.osmdroid.events.MapListener
+import org.osmdroid.events.ScrollEvent
+import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
@@ -84,7 +100,9 @@ import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import java.io.File
 import java.util.Locale
+import kotlin.random.Random
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 private enum class HomeTab { MAP, DEVICES, PROFILE }
 
@@ -99,6 +117,11 @@ data class AuthUiState(
     val isLoading: Boolean = false,
     val user: UserProfile? = null,
     val error: String? = null
+)
+
+data class DevicePin(
+    val name: String,
+    val location: GeoPoint
 )
 
 class MainActivity : ComponentActivity() {
@@ -242,7 +265,16 @@ private fun SmartCityApp(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    val nearbyDevices = remember { mutableStateListOf<String>() }
+    val nearbyDevices = remember { mutableStateListOf<DevicePin>() }
+    val bluetoothAdapter = remember {
+        (context.getSystemService(BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
+    }
+    val wifiManager = remember {
+        context.applicationContext.getSystemService(WIFI_SERVICE) as WifiManager?
+    }
+
+    var mapCenter by remember { mutableStateOf(GeoPoint(21.028511, 105.804817)) }
+    var lastScanBase by remember { mutableStateOf(mapCenter) }
 
     val locationPermissions = remember {
         listOf(
@@ -267,6 +299,28 @@ private fun SmartCityApp(
     var hasPermissions by rememberSaveable {
         mutableStateOf(hasAllPermissions(context, requiredPermissions))
     }
+    var isScanning by rememberSaveable { mutableStateOf(false) }
+    val scannedAddresses = remember { mutableStateListOf<String>() }
+
+    val scanCallback = remember {
+        object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult?) {
+                result?.device?.let { device ->
+                    val address = device.address ?: return
+                    if (!scannedAddresses.contains(address)) {
+                        scannedAddresses.add(address)
+                        val name = device.name ?: "Thiết bị BLE"
+                        nearbyDevices.add(
+                            DevicePin(
+                                name = "$name ($address)",
+                                location = offsetGeo(lastScanBase, scannedAddresses.size)
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
 
     val permissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -286,13 +340,81 @@ private fun SmartCityApp(
     val requestAllPermissions = { permissionsLauncher.launch(requiredPermissions.toTypedArray()) }
 
     val startScan: () -> Unit = {
-        if (!hasPermissions) {
-            requestAllPermissions()
-        } else {
-            nearbyDevices.clear()
-            nearbyDevices.add("Thiết bị demo gần bạn")
-            scope.launch {
-                snackbarHostState.showSnackbar("Đã quét xong (demo), 1 thiết bị được tìm thấy.")
+        when {
+            !hasPermissions -> requestAllPermissions()
+            bluetoothAdapter == null -> scope.launch {
+                snackbarHostState.showSnackbar("Thiết bị không hỗ trợ Bluetooth LE.")
+            }
+
+            !bluetoothAdapter.isEnabled -> scope.launch {
+                snackbarHostState.showSnackbar("Bật Bluetooth để quét thiết bị.")
+            }
+
+            bluetoothAdapter.bluetoothLeScanner == null -> scope.launch {
+                snackbarHostState.showSnackbar("Không thể khởi tạo BLE scanner.")
+            }
+
+            else -> {
+                lastScanBase = mapCenter
+                val scanner = bluetoothAdapter.bluetoothLeScanner!!
+
+                nearbyDevices.clear()
+                scannedAddresses.clear()
+                isScanning = true
+                val base = mapCenter
+
+                val started = try {
+                    scanner.startScan(scanCallback)
+                    true
+                } catch (sec: SecurityException) {
+                    scope.launch { snackbarHostState.showSnackbar("Thiếu quyền BLE (SCAN/CONNECT).") }
+                    isScanning = false
+                    false
+                }
+
+                if (started) {
+                    val wifiReceiver = object : BroadcastReceiver() {
+                        override fun onReceive(ctx: android.content.Context?, intent: Intent?) {
+                            if (intent?.action == WifiManager.SCAN_RESULTS_AVAILABLE_ACTION) {
+                                val results = wifiManager?.scanResults.orEmpty()
+                                results.take(6).forEachIndexed { idx, result ->
+                                    val ssid = if (result.SSID.isNullOrEmpty()) "Wi-Fi ẩn" else result.SSID
+                                    val point = offsetGeo(base, idx + scannedAddresses.size)
+                                    nearbyDevices.add(DevicePin("Wi-Fi: $ssid", point))
+                                }
+                                try {
+                                    context.unregisterReceiver(this)
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }
+                    }
+
+                    if (wifiManager != null) {
+                        try {
+                            context.registerReceiver(
+                                wifiReceiver,
+                                IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
+                            )
+                            wifiManager.startScan()
+                        } catch (_: Exception) {
+                        }
+                    }
+
+                    scope.launch {
+                        delay(8000)
+                        try {
+                            scanner.stopScan(scanCallback)
+                        } catch (_: Exception) {
+                        }
+                        isScanning = false
+                        if (nearbyDevices.isEmpty()) {
+                            snackbarHostState.showSnackbar("Không tìm thấy thiết bị nào (đưa thiết bị vào chế độ pairing).")
+                        }
+                    }
+                } else {
+                    isScanning = false
+                }
             }
         }
     }
@@ -325,10 +447,12 @@ private fun SmartCityApp(
                 isLoading = uiState.isLoading,
                 nearbyDevices = nearbyDevices,
                 hasLocationPermission = hasPermissions || hasAllPermissions(context, locationPermissions),
-                onSignOut = onSignOut,
-                onRequestAllPermissions = requestAllPermissions,
-                onStartScan = startScan
-            )
+            onSignOut = onSignOut,
+            onRequestAllPermissions = requestAllPermissions,
+            onStartScan = startScan,
+            mapCenter = mapCenter,
+            onMapCenterChanged = { mapCenter = it }
+        )
 
             else -> SignInScreen(
                 modifier = Modifier
@@ -433,11 +557,13 @@ private fun HomeScreen(
     modifier: Modifier = Modifier,
     user: UserProfile,
     isLoading: Boolean,
-    nearbyDevices: List<String>,
+    nearbyDevices: List<DevicePin>,
     onSignOut: () -> Unit,
     hasLocationPermission: Boolean,
     onRequestAllPermissions: () -> Unit,
-    onStartScan: () -> Unit
+    onStartScan: () -> Unit,
+    mapCenter: GeoPoint,
+    onMapCenterChanged: (GeoPoint) -> Unit
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(HomeTab.MAP) }
 
@@ -450,7 +576,9 @@ private fun HomeScreen(
                 nearbyDevices = nearbyDevices,
                 hasLocationPermission = hasLocationPermission,
                 onRequestAllPermissions = onRequestAllPermissions,
-                onStartScan = onStartScan
+                onStartScan = onStartScan,
+                mapCenter = mapCenter,
+                onMapCenterChanged = onMapCenterChanged
             )
 
             HomeTab.DEVICES -> DevicesScreen(
@@ -469,7 +597,7 @@ private fun HomeScreen(
         BottomNavBar(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp),
             selectedTab = selectedTab,
             onTabSelected = { selectedTab = it }
         )
@@ -537,64 +665,67 @@ private fun MapScreen(
     modifier: Modifier = Modifier,
     user: UserProfile,
     isLoading: Boolean,
-    nearbyDevices: List<String>,
+    nearbyDevices: List<DevicePin>,
     hasLocationPermission: Boolean,
     onRequestAllPermissions: () -> Unit,
-    onStartScan: () -> Unit
+    onStartScan: () -> Unit,
+    mapCenter: GeoPoint,
+    onMapCenterChanged: (GeoPoint) -> Unit
 ) {
     Column(
-        modifier = modifier.padding(16.dp),
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Card(
-            modifier = Modifier.fillMaxSize(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+        Button(
+            onClick = {
+                if (!hasLocationPermission) onRequestAllPermissions() else onStartScan()
+            },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .padding(16.dp)
-                    .fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+            Text(if (hasLocationPermission) "Quét thiết bị" else "Cấp quyền & quét")
+        }
+        if (nearbyDevices.isNotEmpty()) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Button(
-                    onClick = {
-                        if (!hasLocationPermission) onRequestAllPermissions() else onStartScan()
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Text(if (hasLocationPermission) "Quét thiết bị" else "Cấp quyền & quét")
-                }
-                if (nearbyDevices.isNotEmpty()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = "Thiết bị gần đây:",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                    nearbyDevices.forEach { device ->
                         Text(
-                            text = "Thiết bị gần đây:",
-                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
+                            text = "• ${device.name}",
+                            style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface)
                         )
-                        nearbyDevices.forEach { name ->
-                            Text(
-                                text = "• $name",
-                                style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface)
-                            )
-                        }
                     }
                 }
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(MaterialTheme.colorScheme.surface)
-                ) {
-                    OpenStreetMapView(
-                        modifier = Modifier.fillMaxSize(),
-                        isLoading = isLoading,
-                        hasLocationPermission = hasLocationPermission,
-                        onRequestAllPermissions = onRequestAllPermissions
-                    )
-                }
             }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surface)
+        ) {
+            OpenStreetMapView(
+                modifier = Modifier.fillMaxSize(),
+                isLoading = isLoading,
+                hasLocationPermission = hasLocationPermission,
+                onRequestAllPermissions = onRequestAllPermissions,
+                devicePins = nearbyDevices,
+                onMapCenterChanged = onMapCenterChanged,
+                mapCenter = mapCenter
+            )
         }
     }
 }
@@ -602,7 +733,7 @@ private fun MapScreen(
 @Composable
 private fun DevicesScreen(
     modifier: Modifier = Modifier,
-    nearbyDevices: List<String>,
+    nearbyDevices: List<DevicePin>,
     onStartScan: () -> Unit
 ) {
     Column(
@@ -632,7 +763,7 @@ private fun DevicesScreen(
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Text(
-                            text = device,
+                            text = device.name,
                             modifier = Modifier.padding(12.dp),
                             style = MaterialTheme.typography.bodyLarge
                         )
@@ -673,7 +804,10 @@ private fun OpenStreetMapView(
     modifier: Modifier = Modifier,
     isLoading: Boolean,
     hasLocationPermission: Boolean,
-    onRequestAllPermissions: () -> Unit
+    onRequestAllPermissions: () -> Unit,
+    devicePins: List<DevicePin>,
+    onMapCenterChanged: (GeoPoint) -> Unit,
+    mapCenter: GeoPoint
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -684,12 +818,32 @@ private fun OpenStreetMapView(
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
             controller.setZoom(14.5)
-            controller.setCenter(GeoPoint(21.028511, 105.804817)) // Hanoi
+            controller.setCenter(mapCenter)
         }
     }
 
     val locationOverlay = remember(mapView) {
         MyLocationNewOverlay(GpsMyLocationProvider(context), mapView)
+    }
+
+    DisposableEffect(mapView) {
+        val listener = object : MapListener {
+            override fun onScroll(event: ScrollEvent?): Boolean {
+                mapView.mapCenter?.let { center ->
+                    onMapCenterChanged(GeoPoint(center.latitude, center.longitude))
+                }
+                return false
+            }
+
+            override fun onZoom(event: ZoomEvent?): Boolean {
+                mapView.mapCenter?.let { center ->
+                    onMapCenterChanged(GeoPoint(center.latitude, center.longitude))
+                }
+                return false
+            }
+        }
+        mapView.addMapListener(listener)
+        onDispose { mapView.removeMapListener(listener) }
     }
 
     LaunchedEffect(hasLocationPermission) {
@@ -699,10 +853,29 @@ private fun OpenStreetMapView(
             }
             locationOverlay.enableMyLocation()
             locationOverlay.enableFollowLocation()
+            locationOverlay.myLocation?.let { mapView.controller.animateTo(it) }
         } else {
             locationOverlay.disableMyLocation()
             mapView.overlays.remove(locationOverlay)
         }
+    }
+
+    val deviceMarkers = remember { mutableListOf<org.osmdroid.views.overlay.Marker>() }
+
+    LaunchedEffect(devicePins) {
+        mapView.overlays.removeAll(deviceMarkers)
+        deviceMarkers.clear()
+
+        devicePins.forEach { pin ->
+            val marker = org.osmdroid.views.overlay.Marker(mapView).apply {
+                position = pin.location
+                title = pin.name
+                setAnchor(org.osmdroid.views.overlay.Marker.ANCHOR_CENTER, org.osmdroid.views.overlay.Marker.ANCHOR_BOTTOM)
+            }
+            deviceMarkers.add(marker)
+            mapView.overlays.add(marker)
+        }
+        mapView.invalidate()
     }
 
     DisposableEffect(lifecycleOwner, mapView) {
@@ -727,18 +900,20 @@ private fun OpenStreetMapView(
 
         FloatingActionButton(
             onClick = {
-                if (!hasLocationPermission) {
-                    onRequestAllPermissions()
-                } else {
-                    locationOverlay.myLocation?.let {
-                        mapView.controller.animateTo(it)
-                        mapView.controller.setZoom(16.0)
+                    if (!hasLocationPermission) {
+                        onRequestAllPermissions()
+                    } else {
+                        locationOverlay.myLocation?.let {
+                            mapView.controller.animateTo(it)
+                            mapView.controller.setZoom(16.0)
+                        } ?: run {
+                            mapView.controller.animateTo(mapCenter)
+                        }
                     }
-                }
             },
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(16.dp),
+                .padding(end = 16.dp, bottom = 96.dp),
             containerColor = Color(0xFF0F4C75),
             contentColor = Color.White
         ) {
@@ -769,6 +944,12 @@ private fun configureOsmdroid(context: android.content.Context) {
         osmdroidBasePath = cacheBase
         osmdroidTileCache = tileCache
     }
+}
+
+private fun offsetGeo(base: GeoPoint, index: Int): GeoPoint {
+    val latOffset = Random.nextDouble(-0.002, 0.002) + (index % 3) * 0.0004
+    val lonOffset = Random.nextDouble(-0.002, 0.002) + (index % 3) * 0.0004
+    return GeoPoint(base.latitude + latOffset, base.longitude + lonOffset)
 }
 
 private fun hasAllPermissions(context: android.content.Context, permissions: List<String>): Boolean {
