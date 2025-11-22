@@ -42,17 +42,18 @@ import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.outlined.DevicesOther
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -266,6 +267,7 @@ private fun SmartCityApp(
     val context = LocalContext.current
 
     val nearbyDevices = remember { mutableStateListOf<DevicePin>() }
+    val myDevices = remember { mutableStateListOf<DevicePin>() }
     val bluetoothAdapter = remember {
         (context.getSystemService(BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
     }
@@ -446,13 +448,22 @@ private fun SmartCityApp(
                 user = uiState.user,
                 isLoading = uiState.isLoading,
                 nearbyDevices = nearbyDevices,
+                myDevices = myDevices,
                 hasLocationPermission = hasPermissions || hasAllPermissions(context, locationPermissions),
-            onSignOut = onSignOut,
-            onRequestAllPermissions = requestAllPermissions,
-            onStartScan = startScan,
+                onSignOut = onSignOut,
+                onRequestAllPermissions = requestAllPermissions,
+                onStartScan = startScan,
             mapCenter = mapCenter,
-            onMapCenterChanged = { mapCenter = it }
-        )
+            onMapCenterChanged = { mapCenter = it },
+            onShowDevices = { /* handled inside HomeScreen */ },
+            onSaveDevices = {
+                nearbyDevices.forEach { pin ->
+                    if (myDevices.none { it.name == pin.name }) {
+                        myDevices.add(pin)
+                    }
+                    }
+                }
+            )
 
             else -> SignInScreen(
                 modifier = Modifier
@@ -558,12 +569,15 @@ private fun HomeScreen(
     user: UserProfile,
     isLoading: Boolean,
     nearbyDevices: List<DevicePin>,
+    myDevices: MutableList<DevicePin>,
     onSignOut: () -> Unit,
     hasLocationPermission: Boolean,
     onRequestAllPermissions: () -> Unit,
     onStartScan: () -> Unit,
     mapCenter: GeoPoint,
-    onMapCenterChanged: (GeoPoint) -> Unit
+    onMapCenterChanged: (GeoPoint) -> Unit,
+    onShowDevices: () -> Unit,
+    onSaveDevices: () -> Unit
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(HomeTab.MAP) }
 
@@ -578,12 +592,17 @@ private fun HomeScreen(
                 onRequestAllPermissions = onRequestAllPermissions,
                 onStartScan = onStartScan,
                 mapCenter = mapCenter,
-                onMapCenterChanged = onMapCenterChanged
+                onMapCenterChanged = onMapCenterChanged,
+                onShowDevices = {
+                    selectedTab = HomeTab.DEVICES
+                    onShowDevices()
+                },
+                onSaveDevices = onSaveDevices
             )
 
             HomeTab.DEVICES -> DevicesScreen(
                 modifier = Modifier.fillMaxSize(),
-                nearbyDevices = nearbyDevices,
+                myDevices = myDevices,
                 onStartScan = onStartScan
             )
 
@@ -670,7 +689,9 @@ private fun MapScreen(
     onRequestAllPermissions: () -> Unit,
     onStartScan: () -> Unit,
     mapCenter: GeoPoint,
-    onMapCenterChanged: (GeoPoint) -> Unit
+    onMapCenterChanged: (GeoPoint) -> Unit,
+    onShowDevices: () -> Unit,
+    onSaveDevices: () -> Unit
 ) {
     Column(
         modifier = modifier
@@ -687,25 +708,36 @@ private fun MapScreen(
         ) {
             Text(if (hasLocationPermission) "Quét thiết bị" else "Cấp quyền & quét")
         }
-        if (nearbyDevices.isNotEmpty()) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                shape = RoundedCornerShape(12.dp)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(
-                    modifier = Modifier.padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
-                        text = "Thiết bị gần đây:",
+                        text = "Thiết bị phát hiện",
                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
                     )
-                    nearbyDevices.forEach { device ->
-                        Text(
-                            text = "• ${device.name}",
-                            style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface)
+                    Text(
+                        text = "${nearbyDevices.size} thiết bị gần đây",
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
                         )
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = onSaveDevices, enabled = nearbyDevices.isNotEmpty()) {
+                        Text("Lưu vào của tôi")
+                    }
+                    TextButton(onClick = onShowDevices) {
+                        Text("Xem danh sách")
                     }
                 }
             }
@@ -733,7 +765,7 @@ private fun MapScreen(
 @Composable
 private fun DevicesScreen(
     modifier: Modifier = Modifier,
-    nearbyDevices: List<DevicePin>,
+    myDevices: List<DevicePin>,
     onStartScan: () -> Unit
 ) {
     Column(
@@ -742,22 +774,22 @@ private fun DevicesScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Text(
-            text = "Thiết bị IoT",
+            text = "Thiết bị của tôi",
             style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
         )
         Text(
-            text = "Quét Wi-Fi / Bluetooth gần đây để hiển thị trên bản đồ.",
+            text = "Hiện chưa có danh sách thiết bị đã kết nối. Đồng bộ hoặc thêm thủ công.",
             style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
         )
-        Button(onClick = onStartScan, shape = RoundedCornerShape(14.dp)) { Text("Bắt đầu quét") }
-        if (nearbyDevices.isEmpty()) {
+        Button(onClick = onStartScan, shape = RoundedCornerShape(14.dp)) { Text("Quét thiết bị gần đây") }
+        if (myDevices.isEmpty()) {
             Text(
-                text = "Chưa có thiết bị nào.",
+                text = "Chưa có thiết bị nào được lưu.",
                 style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
             )
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                nearbyDevices.forEach { device ->
+                myDevices.forEach { device ->
                     Card(
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                         shape = RoundedCornerShape(12.dp)
