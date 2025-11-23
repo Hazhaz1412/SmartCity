@@ -49,6 +49,8 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -59,6 +61,8 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -122,7 +126,15 @@ data class AuthUiState(
 
 data class DevicePin(
     val name: String,
-    val location: GeoPoint
+    val location: GeoPoint,
+    val type: String? = null
+)
+
+data class MyDevice(
+    val name: String,
+    val location: GeoPoint,
+    val type: String? = null,
+    var isOn: Boolean = false
 )
 
 class MainActivity : ComponentActivity() {
@@ -267,7 +279,7 @@ private fun SmartCityApp(
     val context = LocalContext.current
 
     val nearbyDevices = remember { mutableStateListOf<DevicePin>() }
-    val myDevices = remember { mutableStateListOf<DevicePin>() }
+    val myDevices = remember { mutableStateListOf<MyDevice>() }
     val bluetoothAdapter = remember {
         (context.getSystemService(BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
     }
@@ -315,7 +327,8 @@ private fun SmartCityApp(
                         nearbyDevices.add(
                             DevicePin(
                                 name = "$name ($address)",
-                                location = offsetGeo(lastScanBase, scannedAddresses.size)
+                                location = offsetGeo(lastScanBase, scannedAddresses.size),
+                                type = "BLE"
                             )
                         )
                     }
@@ -381,8 +394,8 @@ private fun SmartCityApp(
                                 val results = wifiManager?.scanResults.orEmpty()
                                 results.take(6).forEachIndexed { idx, result ->
                                     val ssid = if (result.SSID.isNullOrEmpty()) "Wi-Fi ẩn" else result.SSID
-                                    val point = offsetGeo(base, idx + scannedAddresses.size)
-                                    nearbyDevices.add(DevicePin("Wi-Fi: $ssid", point))
+                            val point = offsetGeo(base, idx + scannedAddresses.size)
+                            nearbyDevices.add(DevicePin("Wi-Fi: $ssid", point, type = "Wi-Fi"))
                                 }
                                 try {
                                     context.unregisterReceiver(this)
@@ -455,12 +468,17 @@ private fun SmartCityApp(
                 onStartScan = startScan,
             mapCenter = mapCenter,
             onMapCenterChanged = { mapCenter = it },
-            onShowDevices = { /* handled inside HomeScreen */ },
-            onSaveDevices = {
-                nearbyDevices.forEach { pin ->
-                    if (myDevices.none { it.name == pin.name }) {
-                        myDevices.add(pin)
+                onShowDevices = { /* handled inside HomeScreen */ },
+                onSaveDevices = {
+                    nearbyDevices.forEach { pin ->
+                        if (myDevices.none { it.name == pin.name }) {
+                            myDevices.add(MyDevice(pin.name, pin.location, pin.type))
+                        }
                     }
+                },
+                onBindDevice = { pin ->
+                    if (myDevices.none { it.name == pin.name }) {
+                        myDevices.add(MyDevice(pin.name, pin.location, pin.type, isOn = false))
                     }
                 }
             )
@@ -569,7 +587,7 @@ private fun HomeScreen(
     user: UserProfile,
     isLoading: Boolean,
     nearbyDevices: List<DevicePin>,
-    myDevices: MutableList<DevicePin>,
+    myDevices: MutableList<MyDevice>,
     onSignOut: () -> Unit,
     hasLocationPermission: Boolean,
     onRequestAllPermissions: () -> Unit,
@@ -577,7 +595,8 @@ private fun HomeScreen(
     mapCenter: GeoPoint,
     onMapCenterChanged: (GeoPoint) -> Unit,
     onShowDevices: () -> Unit,
-    onSaveDevices: () -> Unit
+    onSaveDevices: () -> Unit,
+    onBindDevice: (DevicePin) -> Unit
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(HomeTab.MAP) }
 
@@ -597,13 +616,23 @@ private fun HomeScreen(
                     selectedTab = HomeTab.DEVICES
                     onShowDevices()
                 },
-                onSaveDevices = onSaveDevices
+                onSaveDevices = onSaveDevices,
+                onBindDevice = onBindDevice
             )
 
             HomeTab.DEVICES -> DevicesScreen(
                 modifier = Modifier.fillMaxSize(),
                 myDevices = myDevices,
-                onStartScan = onStartScan
+                onStartScan = onStartScan,
+                onToggle = { index, checked ->
+                    if (index in myDevices.indices) {
+                        myDevices[index] = myDevices[index].copy(isOn = checked)
+                        // TODO: send real control command to backend/device
+                    }
+                },
+                onRemove = { device ->
+                    myDevices.removeAll { it.name == device.name }
+                }
             )
 
             HomeTab.PROFILE -> ProfileScreen(
@@ -679,6 +708,7 @@ private fun BottomNavBar(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MapScreen(
     modifier: Modifier = Modifier,
@@ -691,8 +721,12 @@ private fun MapScreen(
     mapCenter: GeoPoint,
     onMapCenterChanged: (GeoPoint) -> Unit,
     onShowDevices: () -> Unit,
-    onSaveDevices: () -> Unit
+    onSaveDevices: () -> Unit,
+    onBindDevice: (DevicePin) -> Unit
 ) {
+    var showConnectSheet by rememberSaveable { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -713,32 +747,42 @@ private fun MapScreen(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape = RoundedCornerShape(12.dp)
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = "Thiết bị phát hiện",
-                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
-                    )
-                    Text(
-                        text = "${nearbyDevices.size} thiết bị gần đây",
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "Thiết bị phát hiện",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
                         )
-                    )
+                        Text(
+                            text = "${nearbyDevices.size} thiết bị gần đây",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                            )
+                        )
+                    }
+                    TextButton(onClick = onShowDevices) { Text("Thiết bị của tôi") }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = onSaveDevices, enabled = nearbyDevices.isNotEmpty()) {
-                        Text("Lưu vào của tôi")
-                    }
-                    TextButton(onClick = onShowDevices) {
-                        Text("Xem danh sách")
-                    }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { showConnectSheet = true },
+                        enabled = nearbyDevices.isNotEmpty(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) { Text("Kết nối thiết bị") }
+                    OutlinedButton(
+                        onClick = onSaveDevices,
+                        enabled = nearbyDevices.isNotEmpty(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) { Text("Lưu tất cả") }
                 }
             }
         }
@@ -760,13 +804,70 @@ private fun MapScreen(
             )
         }
     }
+
+    if (showConnectSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showConnectSheet = false },
+            sheetState = sheetState
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Chọn thiết bị để kết nối",
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                )
+                if (nearbyDevices.isEmpty()) {
+                    Text("Chưa có thiết bị nào. Hãy quét trước.")
+                } else {
+                    nearbyDevices.take(12).forEach { device ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(device.name, style = MaterialTheme.typography.bodyLarge)
+                                    device.type?.let {
+                                        Text(
+                                            it,
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                            )
+                                        )
+                                    }
+                                }
+                                TextButton(onClick = {
+                                    onBindDevice(device)
+                                    showConnectSheet = false
+                                    onShowDevices()
+                                }) {
+                                    Text("Kết nối")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
 private fun DevicesScreen(
     modifier: Modifier = Modifier,
-    myDevices: List<DevicePin>,
-    onStartScan: () -> Unit
+    myDevices: MutableList<MyDevice>,
+    onStartScan: () -> Unit,
+    onToggle: (Int, Boolean) -> Unit,
+    onRemove: (MyDevice) -> Unit
 ) {
     Column(
         modifier = modifier
@@ -777,10 +878,12 @@ private fun DevicesScreen(
             text = "Thiết bị của tôi",
             style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
         )
-        Text(
-            text = "Hiện chưa có danh sách thiết bị đã kết nối. Đồng bộ hoặc thêm thủ công.",
-            style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
-        )
+        if (myDevices.isEmpty()) {
+            Text(
+                text = "Chưa có thiết bị nào được kết nối. Quét và kết nối để thêm vào danh sách.",
+                style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
+            )
+        }
         Button(onClick = onStartScan, shape = RoundedCornerShape(14.dp)) { Text("Quét thiết bị gần đây") }
         if (myDevices.isEmpty()) {
             Text(
@@ -789,16 +892,46 @@ private fun DevicesScreen(
             )
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                myDevices.forEach { device ->
+                myDevices.forEachIndexed { index, device ->
                     Card(
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text(
-                            text = device.name,
-                            modifier = Modifier.padding(12.dp),
-                            style = MaterialTheme.typography.bodyLarge
-                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = device.name,
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                                device.type?.let {
+                                    Text(
+                                        text = it,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                        )
+                                    )
+                                }
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Switch(
+                                    checked = device.isOn,
+                                    onCheckedChange = { checked -> onToggle(index, checked) },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = Color.White,
+                                        checkedTrackColor = MaterialTheme.colorScheme.primary
+                                    )
+                                )
+                                TextButton(onClick = { onRemove(device) }) {
+                                    Text("Xóa", color = MaterialTheme.colorScheme.error)
+                                }
+                            }
+                        }
                     }
                 }
             }
